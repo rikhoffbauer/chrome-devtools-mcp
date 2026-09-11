@@ -3,21 +3,42 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+
 import assert from 'node:assert';
+import path from 'node:path';
 import {describe, it} from 'node:test';
 
+import sinon from 'sinon';
+
+import type {ParsedArguments} from '../../src/config/mcp-options.js';
+import {TextSnapshot} from '../../src/TextSnapshot.js';
+import {zod} from '../../src/third_party/index.js';
+import {installExtension} from '../../src/tools/extensions.js';
 import {evaluateScript} from '../../src/tools/script.js';
+import {WaitForHelper} from '../../src/utils/WaitForHelper.js';
 import {serverHooks} from '../server.js';
-import {html, withBrowser} from '../utils.js';
+import {
+  assertNoServiceWorkerReported,
+  extractExtensionId,
+  html,
+  withMcpContext,
+} from '../utils.js';
+
+const EXTENSION_PATH = path.join(
+  import.meta.dirname,
+  '../../../tests/tools/fixtures/extension-sw',
+);
 
 describe('script', () => {
   const server = serverHooks();
 
   describe('browser_evaluate_script', () => {
     it('evaluates', async () => {
-      await withBrowser(async (response, context) => {
-        await evaluateScript.handler(
-          {params: {function: String(() => 2 * 5)}},
+      await withMcpContext(async (response, context) => {
+        await evaluateScript().handler(
+          {
+            params: {function: String(() => 2 * 5)},
+          },
           response,
           context,
         );
@@ -25,10 +46,38 @@ describe('script', () => {
         assert.strictEqual(JSON.parse(lineEvaluation), 10);
       });
     });
+    it('skips the stable DOM wait when waitForStableDom is false', async () => {
+      await withMcpContext(async (response, context) => {
+        const spy = sinon.spy(WaitForHelper.prototype, 'waitForStableDom');
+        try {
+          await evaluateScript().handler(
+            {
+              params: {function: String(() => 1), waitForStableDom: false},
+            },
+            response,
+            context,
+          );
+          sinon.assert.notCalled(spy);
+
+          await evaluateScript().handler(
+            {
+              params: {function: String(() => 1)},
+            },
+            response,
+            context,
+          );
+          sinon.assert.calledOnce(spy);
+        } finally {
+          spy.restore();
+        }
+      });
+    });
     it('runs in selected page', async () => {
-      await withBrowser(async (response, context) => {
-        await evaluateScript.handler(
-          {params: {function: String(() => document.title)}},
+      await withMcpContext(async (response, context) => {
+        await evaluateScript().handler(
+          {
+            params: {function: String(() => document.title)},
+          },
           response,
           context,
         );
@@ -37,15 +86,17 @@ describe('script', () => {
         assert.strictEqual(JSON.parse(lineEvaluation), '');
 
         const page = await context.newPage();
-        await page.setContent(`
+        await page.pptrPage.setContent(`
           <head>
             <title>New Page</title>
           </head>
         `);
 
         response.resetResponseLineForTesting();
-        await evaluateScript.handler(
-          {params: {function: String(() => document.title)}},
+        await evaluateScript().handler(
+          {
+            params: {function: String(() => document.title)},
+          },
           response,
           context,
         );
@@ -56,12 +107,12 @@ describe('script', () => {
     });
 
     it('work for complex objects', async () => {
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
 
         await page.setContent(html`<script src="./scripts.js"></script> `);
 
-        await evaluateScript.handler(
+        await evaluateScript().handler(
           {
             params: {
               function: String(() => {
@@ -83,13 +134,82 @@ describe('script', () => {
       });
     });
 
+    it('work for scripts that trigger dialogs', async () => {
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
+
+        await page.setContent(html`<button id="test">test</button>`);
+
+        await evaluateScript().handler(
+          {
+            params: {
+              function: String(() => {
+                alert('hello');
+                return 'Works';
+              }),
+            },
+          },
+          response,
+          context,
+        );
+        const lineEvaluation = response.responseLines.at(2)!;
+        assert.strictEqual(JSON.parse(lineEvaluation), 'Works');
+      });
+    });
+
+    it('work for scripts that trigger dialogs and dismiss them', async () => {
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
+
+        await page.setContent(html`<button id="test">test</button>`);
+
+        await evaluateScript().handler(
+          {
+            params: {
+              function: String(() => {
+                return confirm('hello');
+              }),
+              dialogAction: 'dismiss',
+            },
+          },
+          response,
+          context,
+        );
+        const lineEvaluation = response.responseLines.at(2)!;
+        assert.strictEqual(JSON.parse(lineEvaluation), false);
+      });
+    });
+
+    it('work for scripts that trigger prompts and fill them', async () => {
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
+
+        await page.setContent(html`<button id="test">test</button>`);
+
+        await evaluateScript().handler(
+          {
+            params: {
+              function: String(() => {
+                return prompt('Enter your name:');
+              }),
+              dialogAction: 'John Doe',
+            },
+          },
+          response,
+          context,
+        );
+        const lineEvaluation = response.responseLines.at(2)!;
+        assert.strictEqual(JSON.parse(lineEvaluation), 'John Doe');
+      });
+    });
+
     it('work for async functions', async () => {
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
 
         await page.setContent(html`<script src="./scripts.js"></script> `);
 
-        await evaluateScript.handler(
+        await evaluateScript().handler(
           {
             params: {
               function: String(async () => {
@@ -107,20 +227,22 @@ describe('script', () => {
     });
 
     it('work with one argument', async () => {
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
 
         await page.setContent(html`<button id="test">test</button>`);
 
-        await context.createTextSnapshot();
+        context.getSelectedMcpPage().textSnapshot = await TextSnapshot.create(
+          context.getSelectedMcpPage(),
+        );
 
-        await evaluateScript.handler(
+        await evaluateScript().handler(
           {
             params: {
               function: String(async (el: Element) => {
                 return el.id;
               }),
-              args: [{uid: '1_1'}],
+              args: ['1_1'],
             },
           },
           response,
@@ -132,20 +254,22 @@ describe('script', () => {
     });
 
     it('work with multiple args', async () => {
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
 
         await page.setContent(html`<button id="test">test</button>`);
 
-        await context.createTextSnapshot();
+        context.getSelectedMcpPage().textSnapshot = await TextSnapshot.create(
+          context.getSelectedMcpPage(),
+        );
 
-        await evaluateScript.handler(
+        await evaluateScript().handler(
           {
             params: {
               function: String((container: Element, child: Element) => {
                 return container.contains(child);
               }),
-              args: [{uid: '1_0'}, {uid: '1_1'}],
+              args: ['1_0', '1_1'],
             },
           },
           response,
@@ -163,17 +287,19 @@ describe('script', () => {
       );
       server.addHtmlRoute('/main', html`<iframe src="/iframe"></iframe>`);
 
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
         await page.goto(server.getRoute('/main'));
-        await context.createTextSnapshot();
-        await evaluateScript.handler(
+        context.getSelectedMcpPage().textSnapshot = await TextSnapshot.create(
+          context.getSelectedMcpPage(),
+        );
+        await evaluateScript().handler(
           {
             params: {
               function: String((element: Element) => {
                 return element.textContent;
               }),
-              args: [{uid: '1_3'}],
+              args: ['1_3'],
             },
           },
           response,
@@ -182,6 +308,178 @@ describe('script', () => {
         const lineEvaluation = response.responseLines.at(2)!;
         assert.strictEqual(JSON.parse(lineEvaluation), 'I am iframe button');
       });
+    });
+    it('saves output to file when filePath is provided', async () => {
+      const {rm, readFile} = await import('node:fs/promises');
+      const {tmpdir} = await import('node:os');
+      const {join} = await import('node:path');
+      const filePath = join(tmpdir(), 'test-evaluate-script-output.json');
+      try {
+        await withMcpContext(async (response, context) => {
+          await evaluateScript().handler(
+            {
+              params: {
+                function: String(() => ({hello: 'world'})),
+                filePath,
+              },
+            },
+            response,
+            context,
+          );
+          assert.strictEqual(response.responseLines.length, 1);
+          assert.ok(
+            response.responseLines[0]?.includes('Output saved to'),
+            `Expected "Output saved to" but got: ${response.responseLines[0]}`,
+          );
+        });
+        const content = await readFile(filePath, 'utf-8');
+        assert.deepStrictEqual(JSON.parse(content), {hello: 'world'});
+      } finally {
+        await rm(filePath, {force: true});
+      }
+    });
+    it('evaluates inside extension service worker', async () => {
+      await withMcpContext(
+        async (response, context) => {
+          await installExtension.handler(
+            {params: {path: EXTENSION_PATH}},
+            response,
+            context,
+          );
+
+          const extensionId = extractExtensionId(response);
+          const swTarget = await context.browser.waitForTarget(
+            t => t.type() === 'service_worker' && t.url().includes(extensionId),
+          );
+
+          await context.createExtensionServiceWorkersSnapshot();
+          const swList = context.getExtensionServiceWorkers();
+          const sw = swList.find(s => s.target === swTarget);
+
+          if (!sw) {
+            assert.fail('Service worker not found in context list');
+          }
+
+          const swId = context.getExtensionServiceWorkerId(sw);
+
+          await context.triggerExtensionAction(extensionId);
+
+          response.resetResponseLineForTesting();
+          await evaluateScript({
+            categoryExtensions: true,
+          } as ParsedArguments).handler(
+            {
+              params: {
+                function: String(() => {
+                  return 'chrome' in globalThis ? 'has-chrome' : 'no-chrome';
+                }),
+                serviceWorkerId: swId,
+              },
+            },
+            response,
+            context,
+          );
+
+          const lineEvaluation = response.responseLines.at(2)!;
+          assert.strictEqual(JSON.parse(lineEvaluation), 'has-chrome');
+          await context.uninstallExtension(extensionId);
+          const targets = context.browser.targets();
+          assertNoServiceWorkerReported(targets, extensionId);
+        },
+        {},
+        {categoryExtensions: true},
+      );
+    });
+
+    it('throws error when both pageId and serviceWorkerId are provided', async () => {
+      await withMcpContext(
+        async (response, context) => {
+          await assert.rejects(
+            evaluateScript({
+              categoryExtensions: true,
+            } as ParsedArguments).handler(
+              {
+                params: {
+                  function: String(() => 'test'),
+                  serviceWorkerId: 'example_service_worker',
+                  pageId: 1,
+                },
+              },
+              response,
+              context,
+            ),
+            {
+              message: 'specify either a pageId or a serviceWorkerId.',
+            },
+          );
+        },
+        {},
+        {categoryExtensions: true},
+      );
+    });
+
+    it('throws error when args are provided with serviceWorkerId', async () => {
+      await withMcpContext(
+        async (response, context) => {
+          await assert.rejects(
+            evaluateScript({
+              categoryExtensions: true,
+            } as ParsedArguments).handler(
+              {
+                params: {
+                  function: String(() => 'test'),
+                  serviceWorkerId: 'example_service_worker',
+                  args: ['1_1'],
+                },
+              },
+              response,
+              context,
+            ),
+            {
+              message:
+                'args (element uids) cannot be used when evaluating in a service worker.',
+            },
+          );
+        },
+        {},
+        {categoryExtensions: true},
+      );
+    });
+
+    it('makes pageId optional in schema when categoryExtensions is true and pageIdRouting is true', () => {
+      const tool = evaluateScript({
+        categoryExtensions: true,
+        pageIdRouting: true,
+      } as ParsedArguments);
+      const schema = zod.object(tool.schema);
+      const validSw = schema.safeParse({
+        function: '() => 1',
+        serviceWorkerId: 'sw_1',
+      });
+      assert.strictEqual(validSw.success, true);
+
+      const validPage = schema.safeParse({
+        function: '() => 1',
+        pageId: 1,
+      });
+      assert.strictEqual(validPage.success, true);
+    });
+
+    it('makes pageId required in schema when categoryExtensions is false and pageIdRouting is true', () => {
+      const tool = evaluateScript({
+        pageIdRouting: true,
+      } as ParsedArguments);
+      const schema = zod.object(tool.schema);
+      const resultWithoutPageId = schema.safeParse({
+        function: '() => 1',
+      });
+      assert.strictEqual(resultWithoutPageId.success, false);
+
+      const resultWithPageId = schema.safeParse({
+        function: '() => 1',
+        pageId: 1,
+      });
+      assert.strictEqual(resultWithPageId.success, true);
     });
   });
 });

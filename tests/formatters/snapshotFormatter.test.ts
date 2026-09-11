@@ -9,8 +9,9 @@ import {describe, it} from 'node:test';
 
 import type {ElementHandle} from 'puppeteer-core';
 
-import {formatSnapshotNode} from '../../src/formatters/snapshotFormatter.js';
-import type {TextSnapshotNode} from '../../src/McpContext.js';
+import {SnapshotFormatter} from '../../src/formatters/SnapshotFormatter.js';
+import type {TextSnapshot} from '../../src/TextSnapshot.js';
+import type {TextSnapshotNode} from '../../src/types.js';
 
 describe('snapshotFormatter', () => {
   it('formats a snapshot with value properties', () => {
@@ -19,6 +20,10 @@ describe('snapshotFormatter', () => {
       role: 'textbox',
       name: 'textbox',
       value: 'value',
+      live: 'polite',
+      relevant: 'additions',
+      errormessage: 'error-id',
+      details: 'details-id',
       children: [
         {
           id: '1_2',
@@ -35,10 +40,11 @@ describe('snapshotFormatter', () => {
       },
     };
 
-    const formatted = formatSnapshotNode(node);
+    const formatter = new SnapshotFormatter({root: node} as TextSnapshot);
+    const formatted = formatter.toString();
     assert.strictEqual(
       formatted,
-      `uid=1_1 textbox "textbox" value="value"
+      `uid=1_1 textbox "textbox" details="details-id" errormessage="error-id" live="polite" relevant="additions" value="value"
   uid=1_2 statictext "text"
 `,
     );
@@ -50,6 +56,8 @@ describe('snapshotFormatter', () => {
       role: 'button',
       name: 'button',
       disabled: true,
+      busy: true,
+      atomic: true,
       children: [
         {
           id: '1_2',
@@ -66,10 +74,11 @@ describe('snapshotFormatter', () => {
       },
     };
 
-    const formatted = formatSnapshotNode(node);
+    const formatter = new SnapshotFormatter({root: node} as TextSnapshot);
+    const formatted = formatter.toString();
     assert.strictEqual(
       formatted,
-      `uid=1_1 button "button" disableable disabled
+      `uid=1_1 button "button" atomic busy disableable disabled
   uid=1_2 statictext "text"
 `,
     );
@@ -97,7 +106,8 @@ describe('snapshotFormatter', () => {
       },
     };
 
-    const formatted = formatSnapshotNode(node);
+    const formatter = new SnapshotFormatter({root: node} as TextSnapshot);
+    const formatted = formatter.toString();
     assert.strictEqual(
       formatted,
       `uid=1_1 checkbox "checkbox" checked
@@ -133,18 +143,31 @@ describe('snapshotFormatter', () => {
             return null;
           },
         },
+        {
+          id: '1_4',
+          role: 'slider',
+          name: 'volume',
+          valuemin: 0,
+          valuemax: 100,
+          children: [],
+          elementHandle: async (): Promise<ElementHandle<Element> | null> => {
+            return null;
+          },
+        },
       ],
       elementHandle: async (): Promise<ElementHandle<Element> | null> => {
         return null;
       },
     };
 
-    const formatted = formatSnapshotNode(node);
+    const formatter = new SnapshotFormatter({root: node} as TextSnapshot);
+    const formatted = formatter.toString();
     assert.strictEqual(
       formatted,
       `uid=1_1 root "root"
   uid=1_2 button "button" disableable disabled focusable focused
   uid=1_3 textbox "textbox" value="value"
+  uid=1_4 slider "volume" valuemax="100" valuemin="0"
 `,
     );
   });
@@ -171,15 +194,19 @@ describe('snapshotFormatter', () => {
       },
     };
 
-    const formatted = formatSnapshotNode(node, {
+    const formatter = new SnapshotFormatter({
       snapshotId: '1',
       root: node,
       idToNode: new Map(),
       hasSelectedElement: true,
       verbose: false,
+      resolveCdpElementId() {
+        return undefined;
+      },
     });
+    const formatted = formatter.toString();
 
-    t.assert.snapshot?.(formatted);
+    t.assert.snapshot(formatted);
   });
 
   it('does not include a note if the snapshot is already verbose', t => {
@@ -204,15 +231,19 @@ describe('snapshotFormatter', () => {
       },
     };
 
-    const formatted = formatSnapshotNode(node, {
+    const formatter = new SnapshotFormatter({
       snapshotId: '1',
       root: node,
       idToNode: new Map(),
       hasSelectedElement: true,
       verbose: true,
+      resolveCdpElementId() {
+        return undefined;
+      },
     });
+    const formatted = formatter.toString();
 
-    t.assert.snapshot?.(formatted);
+    t.assert.snapshot(formatted);
   });
 
   it('formats with DevTools data included into a snapshot', t => {
@@ -237,15 +268,91 @@ describe('snapshotFormatter', () => {
       },
     };
 
-    const formatted = formatSnapshotNode(node, {
+    const formatter = new SnapshotFormatter({
       snapshotId: '1',
       root: node,
       idToNode: new Map(),
       hasSelectedElement: true,
       selectedElementUid: '1_1',
       verbose: false,
+      resolveCdpElementId() {
+        return '1_1';
+      },
     });
+    const formatted = formatter.toString();
 
-    t.assert.snapshot?.(formatted);
+    t.assert.snapshot(formatted);
+  });
+
+  it('formats a node with role "none" as ignored', () => {
+    const node: TextSnapshotNode = {
+      id: '1_1',
+      role: 'none',
+      name: '',
+      children: [
+        {
+          id: '1_2',
+          role: 'statictext',
+          name: 'text',
+          children: [],
+          elementHandle: async (): Promise<ElementHandle<Element> | null> => {
+            return null;
+          },
+        },
+      ],
+      elementHandle: async (): Promise<ElementHandle<Element> | null> => {
+        return null;
+      },
+    };
+
+    const formatter = new SnapshotFormatter({root: node} as TextSnapshot);
+    const formatted = formatter.toString();
+    assert.strictEqual(
+      formatted,
+      `uid=1_1 ignored
+  uid=1_2 statictext "text"
+`,
+    );
+  });
+
+  it('toJSON returns expected structure', () => {
+    const node: TextSnapshotNode = {
+      id: '1_1',
+      role: 'root',
+      name: 'root',
+      busy: true,
+      live: 'polite',
+      children: [
+        {
+          id: '1_2',
+          role: 'button',
+          name: 'button',
+          disabled: true,
+          children: [],
+          elementHandle: async () => null,
+        },
+      ],
+      elementHandle: async () => null,
+    };
+
+    const formatter = new SnapshotFormatter({root: node} as TextSnapshot);
+    const json = formatter.toJSON();
+
+    assert.deepStrictEqual(json, {
+      id: '1_1',
+      role: 'root',
+      name: 'root',
+      busy: true,
+      live: 'polite',
+      children: [
+        {
+          id: '1_2',
+          role: 'button',
+          name: 'button',
+          disableable: true,
+          disabled: true,
+        },
+      ],
+    });
   });
 });

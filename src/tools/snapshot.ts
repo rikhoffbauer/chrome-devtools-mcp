@@ -7,11 +7,11 @@
 import {zod} from '../third_party/index.js';
 
 import {ToolCategory} from './categories.js';
-import {defineTool, timeoutSchema} from './ToolDefinition.js';
+import {definePageTool, timeoutSchema} from './ToolDefinition.js';
 
-export const takeSnapshot = defineTool({
+export const takeSnapshot = definePageTool({
   name: 'take_snapshot',
-  description: `Take a text snapshot of the currently selected page based on the a11y tree. The snapshot lists page elements along with a unique
+  description: `Take a text snapshot of the target page based on the a11y tree. The snapshot lists page elements along with a unique
 identifier (uid). Always use the latest snapshot. Prefer taking a snapshot over taking a screenshot. The snapshot indicates the element selected
 in the DevTools Elements panel (if any).`,
   annotations: {
@@ -33,6 +33,10 @@ in the DevTools Elements panel (if any).`,
         'The absolute path, or a path relative to the current working directory, to save the snapshot to instead of attaching it to the response.',
       ),
   },
+  blockedByDialog: true,
+  verifyFilesSchema: {
+    filePath: true,
+  },
   handler: async (request, response) => {
     response.includeSnapshot({
       verbose: request.params.verbose ?? false,
@@ -41,7 +45,7 @@ in the DevTools Elements panel (if any).`,
   },
 });
 
-export const waitFor = defineTool({
+export const waitFor = definePageTool({
   name: 'wait_for',
   description: `Wait for the specified text to appear on the selected page.`,
   annotations: {
@@ -49,14 +53,22 @@ export const waitFor = defineTool({
     readOnlyHint: true,
   },
   schema: {
-    text: zod.string().describe('Text to appear on the page'),
+    text: zod
+      .array(zod.string())
+      .min(1)
+      .describe(
+        'Non-empty list of texts. Resolves when any value appears on the page.',
+      ),
     ...timeoutSchema,
   },
-  handler: async (request, response, context) => {
-    await context.waitForTextOnPage(request.params);
+  blockedByDialog: true,
+  verifyFilesSchema: {},
+  handler: async (request, response) => {
+    const page = request.page;
+    await page.waitForTextOnPage(request.params.text, request.params.timeout);
 
     response.appendResponseLine(
-      `Element with text "${request.params.text}" found.`,
+      `Element matching one of ${JSON.stringify(request.params.text)} found.`,
     );
 
     response.includeSnapshot();

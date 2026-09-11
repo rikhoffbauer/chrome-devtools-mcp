@@ -3,6 +3,7 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+
 import assert from 'node:assert';
 import {describe, it} from 'node:test';
 
@@ -11,14 +12,23 @@ import {
   listNetworkRequests,
 } from '../../src/tools/network.js';
 import {serverHooks} from '../server.js';
-import {html, withBrowser, stabilizeResponseOutput} from '../utils.js';
+import {
+  getTextContent,
+  html,
+  stabilizeResponseOutput,
+  withMcpContext,
+} from '../utils.js';
 
 describe('network', () => {
   const server = serverHooks();
   describe('network_list_requests', () => {
     it('list requests', async () => {
-      await withBrowser(async (response, context) => {
-        await listNetworkRequests.handler({params: {}}, response, context);
+      await withMcpContext(async (response, context) => {
+        await listNetworkRequests.handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
         assert.ok(response.includeNetworkRequests);
         assert.strictEqual(response.networkRequestsPageIdx, undefined);
       });
@@ -29,21 +39,25 @@ describe('network', () => {
       server.addHtmlRoute('/two', html`<main>Second</main>`);
       server.addHtmlRoute('/three', html`<main>Third</main>`);
 
-      await withBrowser(async (response, context) => {
-        await context.setUpNetworkCollectorForTesting();
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        await context.getSelectedMcpPage().setUpNetworkCollectorForTesting();
+        const page = context.getSelectedMcpPage().pptrPage;
         await page.goto(server.getRoute('/one'));
         await page.goto(server.getRoute('/two'));
         await page.goto(server.getRoute('/three'));
         await listNetworkRequests.handler(
           {
             params: {},
+
+            page: context.getSelectedMcpPage(),
           },
           response,
           context,
         );
-        const responseData = await response.handle('list_request', context);
-        t.assert.snapshot?.(stabilizeResponseOutput(responseData[0].text));
+        const responseData = await response.handle(context);
+        t.assert.snapshot(
+          stabilizeResponseOutput(getTextContent(responseData.content[0])),
+        );
       });
     });
 
@@ -52,9 +66,9 @@ describe('network', () => {
       server.addHtmlRoute('/two', html`<main>Second</main>`);
       server.addHtmlRoute('/three', html`<main>Third</main>`);
 
-      await withBrowser(async (response, context) => {
-        await context.setUpNetworkCollectorForTesting();
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        await context.getSelectedMcpPage().setUpNetworkCollectorForTesting();
+        const page = context.getSelectedMcpPage().pptrPage;
         await page.goto(server.getRoute('/one'));
         await page.goto(server.getRoute('/two'));
         await page.goto(server.getRoute('/three'));
@@ -63,12 +77,15 @@ describe('network', () => {
             params: {
               includePreservedRequests: true,
             },
+            page: context.getSelectedMcpPage(),
           },
           response,
           context,
         );
-        const responseData = await response.handle('list_request', context);
-        t.assert.snapshot?.(stabilizeResponseOutput(responseData[0].text));
+        const responseData = await response.handle(context);
+        t.assert.snapshot(
+          stabilizeResponseOutput(getTextContent(responseData.content[0])),
+        );
       });
     });
 
@@ -92,31 +109,36 @@ describe('network', () => {
         html`<main>I was redirected 2 times</main>`,
       );
 
-      await withBrowser(async (response, context) => {
-        await context.setUpNetworkCollectorForTesting();
-        const page = context.getSelectedPage();
-        await page.goto(server.getRoute('/redirect'));
+      await withMcpContext(async (response, context) => {
+        await context.getSelectedMcpPage().setUpNetworkCollectorForTesting();
+        const page = context.getSelectedMcpPage().pptrPage;
+        await page.goto(server.getRoute('/redirect'), {
+          waitUntil: 'networkidle0',
+        });
         await listNetworkRequests.handler(
           {
             params: {
               includePreservedRequests: true,
             },
+            page: context.getSelectedMcpPage(),
           },
           response,
           context,
         );
-        const responseData = await response.handle('list_request', context);
-        t.assert.snapshot?.(stabilizeResponseOutput(responseData[0].text));
+        const responseData = await response.handle(context);
+        t.assert.snapshot(
+          stabilizeResponseOutput(getTextContent(responseData.content[0])),
+        );
       });
     });
   });
   describe('network_get_request', () => {
     it('attaches request', async () => {
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
         await page.goto('data:text/html,<div>Hello MCP</div>');
         await getNetworkRequest.handler(
-          {params: {reqid: 1}},
+          {params: {reqid: 1}, page: context.getSelectedMcpPage()},
           response,
           context,
         );
@@ -125,11 +147,11 @@ describe('network', () => {
       });
     });
     it('should not add the request list', async () => {
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedMcpPage().pptrPage;
         await page.goto('data:text/html,<div>Hello MCP</div>');
         await getNetworkRequest.handler(
-          {params: {reqid: 1}},
+          {params: {reqid: 1}, page: context.getSelectedMcpPage()},
           response,
           context,
         );
@@ -141,9 +163,9 @@ describe('network', () => {
       server.addHtmlRoute('/two', html`<main>Second</main>`);
       server.addHtmlRoute('/three', html`<main>Third</main>`);
 
-      await withBrowser(async (response, context) => {
-        await context.setUpNetworkCollectorForTesting();
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        await context.getSelectedMcpPage().setUpNetworkCollectorForTesting();
+        const page = context.getSelectedMcpPage().pptrPage;
         await page.goto(server.getRoute('/one'));
         await page.goto(server.getRoute('/two'));
         await page.goto(server.getRoute('/three'));
@@ -152,13 +174,16 @@ describe('network', () => {
             params: {
               reqid: 1,
             },
+            page: context.getSelectedMcpPage(),
           },
           response,
           context,
         );
-        const responseData = await response.handle('get_request', context);
+        const responseData = await response.handle(context);
 
-        t.assert.snapshot?.(stabilizeResponseOutput(responseData[0].text));
+        t.assert.snapshot(
+          stabilizeResponseOutput(getTextContent(responseData.content[0])),
+        );
       });
     });
   });

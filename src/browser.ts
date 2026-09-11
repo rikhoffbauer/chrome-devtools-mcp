@@ -4,38 +4,30 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {execSync} from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import {logger} from './logger.js';
 import type {
   Browser,
   ChromeReleaseChannel,
   LaunchOptions,
-  Target,
 } from './third_party/index.js';
 import {puppeteer} from './third_party/index.js';
+import {logger, puppeteerLogger} from './utils/logger.js';
+import {isAllowedUrl} from './utils/url.js';
 
 let browser: Browser | undefined;
+let browserMode: 'launched' | 'connected' | undefined;
 
-function makeTargetFilter() {
-  const ignoredPrefixes = new Set([
-    'chrome://',
-    'chrome-extension://',
-    'chrome-untrusted://',
-  ]);
-
-  return function targetFilter(target: Target): boolean {
-    if (target.url() === 'chrome://newtab/') {
+export function makeTargetFilter(enableExtensions = false) {
+  return function targetFilter(target: {url(): string}): boolean {
+    const url = target.url();
+    if (!url) {
       return true;
     }
-    for (const prefix of ignoredPrefixes) {
-      if (target.url().startsWith(prefix)) {
-        return false;
-      }
-    }
-    return true;
+    return isAllowedUrl(url, {categoryExtensions: enableExtensions});
   };
 }
 
@@ -44,17 +36,27 @@ export async function ensureBrowserConnected(options: {
   wsEndpoint?: string;
   wsHeaders?: Record<string, string>;
   devtools: boolean;
+  channel?: Channel;
+  userDataDir?: string;
+  enableExtensions?: boolean;
+  blocklist?: string[];
+  allowlist?: string[];
 }) {
+  const {channel, enableExtensions} = options;
   if (browser?.connected) {
     return browser;
   }
 
   const connectOptions: Parameters<typeof puppeteer.connect>[0] = {
-    targetFilter: makeTargetFilter(),
+    targetFilter: makeTargetFilter(enableExtensions),
     defaultViewport: null,
     handleDevToolsAsPage: true,
+    blocklist: options.blocklist,
+    allowlist: options.allowlist,
+    logger: puppeteerLogger,
   };
 
+  let autoConnect = false;
   if (options.wsEndpoint) {
     connectOptions.browserWSEndpoint = options.wsEndpoint;
     if (options.wsHeaders) {
@@ -62,13 +64,70 @@ export async function ensureBrowserConnected(options: {
     }
   } else if (options.browserURL) {
     connectOptions.browserURL = options.browserURL;
+  } else if (channel || options.userDataDir) {
+    const userDataDir = options.userDataDir;
+    if (userDataDir) {
+      autoConnect = true;
+      // TODO: re-expose this logic via Puppeteer.
+      const portPath = path.join(userDataDir, 'DevToolsActivePort');
+      try {
+        const fileContent = await fs.promises.readFile(portPath, 'utf8');
+        const [rawPort, rawPath] = fileContent
+          .split('\n')
+          .map(line => {
+            return line.trim();
+          })
+          .filter(line => {
+            return !!line;
+          });
+        if (!rawPort || !rawPath) {
+          throw new Error(`Invalid DevToolsActivePort '${fileContent}' found`);
+        }
+        const port = parseInt(rawPort, 10);
+        if (isNaN(port) || port <= 0 || port > 65535) {
+          throw new Error(`Invalid port '${rawPort}' found`);
+        }
+        const browserWSEndpoint = `ws://127.0.0.1:${port}${rawPath}`;
+        connectOptions.browserWSEndpoint = browserWSEndpoint;
+      } catch (error) {
+        throw new Error(
+          `Could not connect to Chrome in ${userDataDir}. Check if Chrome is running and remote debugging is enabled by going to chrome://inspect/#remote-debugging.`,
+          {
+            cause: error,
+          },
+        );
+      }
+    } else {
+      if (!channel) {
+        throw new Error('Channel must be provided if userDataDir is missing');
+      }
+      connectOptions.channel = (
+        channel === 'stable' ? 'chrome' : `chrome-${channel}`
+      ) as ChromeReleaseChannel;
+    }
   } else {
-    throw new Error('Either browserURL or wsEndpoint must be provided');
+    throw new Error(
+      'Either browserURL, wsEndpoint, channel or userDataDir must be provided',
+    );
   }
 
-  logger('Connecting Puppeteer to ', JSON.stringify(connectOptions));
-  browser = await puppeteer.connect(connectOptions);
-  logger('Connected Puppeteer');
+  logger?.('Connecting Puppeteer to ', JSON.stringify(connectOptions));
+  try {
+    // Assign mode before browser so a concurrent closeBrowser() never sees
+    // `browser` set with `browserMode` still undefined (would fall through
+    // to the disconnect() path and orphan a launched Chrome).
+    const connected = await puppeteer.connect(connectOptions);
+    browserMode = 'connected';
+    browser = connected;
+  } catch (err) {
+    throw new Error(
+      `Could not connect to Chrome. ${autoConnect ? `Check if Chrome is running and remote debugging is enabled by going to chrome://inspect/#remote-debugging.` : `Check if Chrome is running.`}`,
+      {
+        cause: err,
+      },
+    );
+  }
+  logger?.('Connected Puppeteer');
   return browser;
 }
 
@@ -84,8 +143,31 @@ interface McpLaunchOptions {
     width: number;
     height: number;
   };
-  args?: string[];
+  chromeArgs?: string[];
+  ignoreDefaultChromeArgs?: string[];
   devtools: boolean;
+  enableExtensions?: boolean;
+  viaCli?: boolean;
+  blocklist?: string[];
+  allowlist?: string[];
+}
+
+export function detectDisplay(): void {
+  // Only detect display on Linux/UNIX.
+  if (os.platform() === 'win32' || os.platform() === 'darwin') {
+    return;
+  }
+  if (!process.env['DISPLAY']) {
+    try {
+      const result = execSync(
+        `ps -u $(id -u) -o pid= | xargs -I{} cat /proc/{}/environ 2>/dev/null | tr '\\0' '\\n' | grep -m1 '^DISPLAY=' | cut -d= -f2`,
+      );
+      const display = result.toString('utf8').trim();
+      process.env['DISPLAY'] = display;
+    } catch {
+      // no-op
+    }
+  }
 }
 
 export async function launch(options: McpLaunchOptions): Promise<Browser> {
@@ -100,7 +182,7 @@ export async function launch(options: McpLaunchOptions): Promise<Browser> {
     userDataDir = path.join(
       os.homedir(),
       '.cache',
-      'chrome-devtools-mcp',
+      options.viaCli ? 'chrome-devtools-mcp-cli' : 'chrome-devtools-mcp',
       profileDirName,
     );
     await fs.promises.mkdir(userDataDir, {
@@ -109,9 +191,12 @@ export async function launch(options: McpLaunchOptions): Promise<Browser> {
   }
 
   const args: LaunchOptions['args'] = [
-    ...(options.args ?? []),
+    ...(options.chromeArgs ?? []),
     '--hide-crash-restore-bubble',
   ];
+  const ignoreDefaultArgs: LaunchOptions['ignoreDefaultArgs'] =
+    options.ignoreDefaultChromeArgs ?? false;
+
   if (headless) {
     args.push('--screen-info={3840x2160}');
   }
@@ -126,18 +211,27 @@ export async function launch(options: McpLaunchOptions): Promise<Browser> {
         : 'chrome';
   }
 
+  if (!headless) {
+    detectDisplay();
+  }
+
   try {
     const browser = await puppeteer.launch({
       channel: puppeteerChannel,
-      targetFilter: makeTargetFilter(),
+      targetFilter: makeTargetFilter(options.enableExtensions),
       executablePath,
       defaultViewport: null,
       userDataDir,
       pipe: true,
       headless,
       args,
+      ignoreDefaultArgs: ignoreDefaultArgs,
       acceptInsecureCerts: options.acceptInsecureCerts,
       handleDevToolsAsPage: true,
+      enableExtensions: options.enableExtensions,
+      blocklist: options.blocklist,
+      allowlist: options.allowlist,
+      logger: puppeteerLogger,
     });
     if (options.logFile) {
       // FIXME: we are probably subscribing too late to catch startup logs. We
@@ -147,7 +241,6 @@ export async function launch(options: McpLaunchOptions): Promise<Browser> {
     }
     if (options.viewport) {
       const [page] = await browser.pages();
-      // @ts-expect-error internal API for now.
       await page?.resize({
         contentWidth: options.viewport.width,
         contentHeight: options.viewport.height,
@@ -176,8 +269,37 @@ export async function ensureBrowserLaunched(
   if (browser?.connected) {
     return browser;
   }
-  browser = await launch(options);
+  // Assign mode before browser; see the connect path above for rationale.
+  const launched = await launch(options);
+  browserMode = 'launched';
+  browser = launched;
   return browser;
+}
+
+/**
+ * Shutdown hook for the active browser. Closes a launched browser (so the
+ * Chrome subprocess is reaped) or disconnects from an attached browser (so
+ * the user's Chrome instance stays alive). No-op if no browser is active or
+ * the connection has already been dropped. Called from the server entrypoint
+ * on stdin EOF / SIGTERM / SIGINT.
+ */
+export async function closeBrowser(): Promise<void> {
+  const b = browser;
+  const mode = browserMode;
+  browser = undefined;
+  browserMode = undefined;
+  if (!b || !b.connected) {
+    return;
+  }
+  if (mode === 'launched') {
+    await b.close().catch(err => {
+      logger?.('Failed to close browser', err);
+    });
+    return;
+  }
+  await b.disconnect().catch(err => {
+    logger?.('Failed to disconnect from browser', err);
+  });
 }
 
 export type Channel = 'stable' | 'canary' | 'beta' | 'dev';
